@@ -1,0 +1,287 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*- 
+
+#
+# Copyright 2014, 2015, 2016, 2017 Guenter Bartsch
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Lesser General Public License for more details.
+# 
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+#
+# simple HTTP TTS server using
+# * MaryTTS, espeak and sequitur for g2p,
+# * MaryTTS and espeak for synthesis and
+# * pulseaudio for actual audio output
+#
+
+import sys
+import os
+import traceback 
+import json
+import socket
+import time
+import errno
+import logging
+
+from optparse import OptionParser
+from setproctitle import setproctitle
+from BaseHTTPServer import BaseHTTPRequestHandler,HTTPServer
+from urlparse import urlparse, parse_qs
+
+from nltools.maryclient     import mary_init, mary_set_voice, mary_set_locale, mary_synth,\
+                                   mary_synth_phonemes, mary_gen_phonemes
+from nltools.phonetics      import ipa2mary, mary2ipa
+from nltools.espeakclient   import espeak_gen_ipa, espeak_synth, espeak_synth_phonemes
+from nltools.sequiturclient import sequitur_gen_ipa
+from nltools.pulseplayer    import PulsePlayer
+
+PROC_TITLE           = 'tts_server'
+
+MARY_RECONNECT_DELAY = 5
+
+DEFAULT_HOST         = 'localhost'
+DEFAULT_PORT         = 8300
+
+DEFAULT_MARY_VOICE   = 'cmu-rms-hsmm'
+DEFAULT_MARY_LOCALE  = 'en_US'
+
+SEQUITUR_MODELS = { 'de' : 'models/sequitur-voxforge-de-r20161117' }
+
+class TTSHandler(BaseHTTPRequestHandler):
+	
+    def do_GET(self):
+
+        logging.debug("GET %s" % self.path)
+
+        try:
+
+            urlp = urlparse(self.path)
+
+            path = urlp.path
+            query_components = parse_qs(urlp.query)
+
+            logging.debug('path=%s, query_components=%s' % (repr(path), repr(query_components)))
+
+            if path=="/tts/g2p":
+
+                locale   = query_components['l'][0] 
+                voice    = query_components['v'][0]
+                engine   = query_components['e'][0]
+                txt      = query_components['t'][0].decode('utf8')
+              
+                if engine == 'mary':
+
+                    mary_set_voice  (voice)
+                    mary_set_locale (locale)
+
+                    mp = mary_gen_phonemes (txt)
+                    reply = mary2ipa(txt, mp)
+
+                elif engine == 'espeak':
+
+                    reply = espeak_gen_ipa (voice, txt)
+
+                elif engine == 'sequitur':
+
+                    if not voice in SEQUITUR_MODELS:
+                        raise Exception ("no sequitur model for voice '%s'" % voice)
+
+                    reply = sequitur_gen_ipa (SEQUITUR_MODELS[voice], txt)
+
+                else:
+                    raise Exception ("unknown engine '%s'" % engine)
+
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                reply = {'ipa': reply }
+
+                self.wfile.write(json.dumps(reply))
+
+            elif path=="/tts/synth":
+
+                locale   = query_components['l'][0] 
+                voice    = query_components['v'][0]
+                engine   = query_components['e'][0]
+                mode     = query_components['m'][0]
+                txt      = query_components['t'][0].decode('utf8')
+
+                wav = None
+
+                if engine == 'mary':
+
+                    mary_set_voice  (voice)
+                    mary_set_locale (locale)
+
+                    if mode == 'txt':
+                        wav = mary_synth (txt)
+                    elif mode == 'ipa':
+                        xs = ipa2mary ('ipa', txt)
+                        wav = mary_synth_phonemes (xs)
+                    else:
+                        raise Exception ("unknown mary mode '%s'" % mode)
+
+                elif engine == 'espeak':
+   
+                    if mode == 'txt':
+                        wav = espeak_synth (voice, txt)
+
+                    elif mode == 'ipa':
+                        xs = ipa2xsampa ('ipa', txt)
+                        wav = espeak_synth_phonemes (voice, xs)
+
+                    else:
+                        raise Exception ("unknown espeak mode '%s'" % mode)
+                else:
+
+                    raise Exception ("unknown engine '%s'" % engine)
+
+                if wav:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'audio/wave')
+                    self.end_headers()
+                    self.wfile.write(wav)
+                else:
+                    self.send_response(400)
+                    self.end_headers()
+
+            else:
+                raise Exception ("GET: unknown path '%s'" % path)
+
+        except:
+
+            logging.error(traceback.format_exc())
+
+            self.send_response(400)
+            self.end_headers()
+
+    def do_POST(self):
+ 
+        global player
+
+        logging.debug("POST %s" % self.path)
+
+        try:
+
+            urlp = urlparse(self.path)
+
+            path = urlp.path
+            query_components = parse_qs(urlp.query)
+
+            logging.debug('path=%s, query_components=%s' % (repr(path), repr(query_components)))
+
+            length = int(self.headers.get('Content-Length'))
+            # self.send_response(100)
+            self.wfile.write("%s 100 Continue\r\n\r\n" % (self.protocol_version))
+
+
+            if path=="/tts/play":
+
+                wav   = self.rfile.read(length)
+                async = 'async' in query_components
+
+                logging.debug ('wav data: %d bytes %x %x %x %x ...' % (len(wav), 
+                                                                       ord(wav[0]), 
+                                                                       ord(wav[1]), 
+                                                                       ord(wav[2]), 
+                                                                       ord(wav[3])))
+
+                player.play(wav, async)
+
+                self.send_response(200)
+                self.end_headers()
+
+            else:
+                raise Exception ("POST: unknown path '%s'" % path)
+
+        except:
+
+            logging.error(traceback.format_exc())
+
+            self.send_response(400)
+            self.end_headers()
+
+if __name__ == '__main__':
+
+    #
+    # init
+    #
+
+    setproctitle (PROC_TITLE)
+
+    #
+    # cmdline
+    #
+
+    parser = OptionParser("usage: %prog [options] ")
+
+    parser.add_option ("-v", "--verbose", action="store_true", dest="verbose",
+                       help="verbose output")
+
+    parser.add_option ("-H", "--host", dest="host", type = "string", default=DEFAULT_HOST,
+                       help="host, default: %s" % DEFAULT_HOST)
+
+    parser.add_option ("-p", "--port", dest="port", type = "int", default=DEFAULT_PORT,
+                       help="port, default: %d" % DEFAULT_PORT)
+
+    (options, args) = parser.parse_args()
+
+    if options.verbose:
+        logging.basicConfig(level=logging.DEBUG)
+        debug=True
+    else:
+        logging.basicConfig(level=logging.INFO)
+        debug=False
+
+
+    #
+    # MARY TTS
+    #
+
+    mary_init()
+    mary_set_voice  (DEFAULT_MARY_VOICE)
+    mary_set_locale (DEFAULT_MARY_LOCALE)
+
+    while True:
+
+        try:
+            mary_synth ('Ready.')
+            break
+        except socket.error as serr:
+            if serr.errno != errno.ECONNREFUSED:
+                raise serr
+            logging.error("Connection refused. Sleeping...")
+            time.sleep(MARY_RECONNECT_DELAY)
+
+    #
+    # pulseaudio player
+    #
+
+    player = PulsePlayer(PROC_TITLE)
+
+    #
+    # run HTTP server
+    #
+
+    try:
+        server = HTTPServer((options.host, options.port), TTSHandler)
+        logging.info('listening for HTTP requests on %s:%d' % (options.host, options.port))
+        
+        # wait forever for incoming http requests
+        server.serve_forever()
+
+    except KeyboardInterrupt:
+        logging.error('^C received, shutting down the web server')
+        server.socket.close()
+
