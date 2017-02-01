@@ -41,7 +41,7 @@ from urlparse import urlparse, parse_qs
 
 from nltools.maryclient     import mary_init, mary_set_voice, mary_set_locale, mary_synth,\
                                    mary_synth_phonemes, mary_gen_phonemes
-from nltools.phonetics      import ipa2mary, mary2ipa
+from nltools.phonetics      import ipa2mary, mary2ipa, ipa2xsampa
 from nltools.espeakclient   import espeak_gen_ipa, espeak_synth, espeak_synth_phonemes
 from nltools.sequiturclient import sequitur_gen_ipa
 from nltools.pulseplayer    import PulsePlayer
